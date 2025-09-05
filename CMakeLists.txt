@@ -65,6 +65,7 @@ set (PROJECTS
 	src/lib/cimbar_js
 	src/lib/compression
 	src/lib/encoder
+	src/lib/extractor
 	src/lib/fountain
 	src/lib/gui
 	src/lib/image_hash
@@ -83,11 +84,11 @@ set (PROJECTS
 if(NOT DEFINED USE_WASM)
 set(PROJECTS
 	${PROJECTS}
-	src/lib/extractor
 
 	src/exe/cimbar
 	src/exe/cimbar_extract
 	src/exe/cimbar_recv
+	src/exe/cimbar_recv2
 	src/exe/cimbar_send
 	src/exe/build_image_assets
 )
