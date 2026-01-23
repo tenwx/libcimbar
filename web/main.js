@@ -1,14 +1,20 @@
 var Main = function () {
 
+  // configurable
   var _interval = 66;
-  var _pause = 0;
+  var _colorBalance = false;
 
+  // internal
+  var _pause = 0;
   var _showStats = false;
   var _counter = 0;
   var _renderTime = 0;
 
+  var _wakeLock = undefined;
+
   // cached
   var _idealRatio = 1;
+  var _compressBuff = undefined;
 
   function toggleFullscreen() {
     if (document.fullscreenElement) {
@@ -19,17 +25,45 @@ var Main = function () {
     }
   }
 
-  function importFile(f) {
-    const fileReader = new FileReader();
-    fileReader.onload = (event) => {
-      const fileData = new Uint8Array(event.target.result);
-      Main.encode(f.name, fileData);
-    };
-    fileReader.onerror = () => {
-      console.error('Unable to read file ' + f.name + '.');
+  function importFile(file) {
+    let chunkSize = Module._cimbare_encode_bufsize();
+    if (_compressBuff === undefined) {
+      const dataPtr = Module._malloc(chunkSize);
+      _compressBuff = new Uint8Array(Module.HEAPU8.buffer, dataPtr, chunkSize);
+    }
+    let offset = 0;
+    let reader = new FileReader();
+
+    Main.encode_init(file.name);
+
+    reader.onload = function (event) {
+      const datalen = event.target.result.byteLength;
+      if (datalen > 0) {
+        // copy to wasm buff and write
+        const uint8View = new Uint8Array(event.target.result);
+        _compressBuff.set(uint8View);
+        const buffView = new Uint8Array(Module.HEAPU8.buffer, _compressBuff.byteOffset, datalen);
+        Main.encode_bytes(buffView);
+
+        offset += chunkSize;
+        readNext();
+      } else {
+        // Done reading file
+        console.log("Finished reading file.");
+
+        // this null call is functionally a flush()
+        // so a no-op, unless it isn't
+        const nullBuff = new Uint8Array(Module.HEAPU8.buffer, _compressBuff.byteOffset, 0);
+        Main.encode_bytes(nullBuff);
+      }
     };
 
-    fileReader.readAsArrayBuffer(f);
+    function readNext() {
+      let slice = file.slice(offset, offset + chunkSize);
+      reader.readAsArrayBuffer(slice);
+    }
+
+    readNext();
   }
 
   function copyToWasmHeap(abuff) {
@@ -43,7 +77,6 @@ var Main = function () {
   return {
     init: function (canvas) {
       Main.setMode('B');
-      Main.resize();
       Main.check_GL_enabled(canvas);
     },
 
@@ -61,6 +94,7 @@ var Main = function () {
       var height = window.innerHeight - 10;
       Main.scaleCanvas(canvas, width, height);
       Main.alignInvisibleClick(canvas);
+      Main.checkNavButtonOverlap();
     },
 
     toggleFullscreen: function () {
@@ -84,6 +118,8 @@ var Main = function () {
       // using ratio from current config,
       // determine optimal dimensions and rotation
       var needRotate = _idealRatio > 1 && height > width;
+      Module._cimbare_rotate_window(needRotate);
+
       var ourRatio = needRotate ? height / width : width / height;
 
       var xdim = needRotate ? height : width;
@@ -96,22 +132,13 @@ var Main = function () {
       }
 
       console.log(xdim + "x" + ydim);
-      canvas.style.width = xdim + "px";
-      canvas.style.height = ydim + "px";
       if (needRotate) {
-        // TODO: rotating #dragdrop around the center doesn't work for inane
-        //  css reasons. So here's a hack to move it where it should be. css sucks.
-        // if at some point this is understood/fixed, we should define a static css rule
-        //  to match against `.rotated`
-        var translate = -Math.floor(width / 2) - Math.floor(width / 96) + "px";
-        var dragdrop = document.getElementById('dragdrop');
-        dragdrop.style.transform = "rotate(90deg) translateX(-50%) translateY(" + translate + ")";
-        dragdrop.classList.add("rotated");
+        canvas.style.width = ydim + "px";
+        canvas.style.height = xdim + "px";
       }
       else {
-        var dragdrop = document.getElementById('dragdrop');
-        dragdrop.style.transform = "";
-        dragdrop.classList.remove("rotated");
+        canvas.style.width = xdim + "px";
+        canvas.style.height = ydim + "px";
       }
     },
 
@@ -126,22 +153,43 @@ var Main = function () {
       invisible_click.style.zoom = canvas.style.zoom;
     },
 
-    encode: function (filename, data) {
+    encode_init: function (filename) {
       console.log("encoding " + filename);
-      const wasmData = copyToWasmHeap(data);
       const wasmFn = copyToWasmHeap(new TextEncoder("utf-8").encode(filename));
-
       try {
-        var res = Module._cimbare_encode(wasmData.byteOffset, wasmData.length, wasmFn.byteOffset, wasmFn.length, -1);
-        console.log("encode returned " + res);
+        var res = Module._cimbare_init_encode(wasmFn.byteOffset, wasmFn.length, -1);
+        console.log("init_encode returned " + res);
       } finally {
-        Module._free(wasmData.byteOffset);
         Module._free(wasmFn.byteOffset);
       }
 
       Main.setTitle(filename);
       Main.setHTML("current-file", filename);
-      Main.setActive(true);
+    },
+
+    prevent_sleep: async function () {
+      if (_wakeLock) {
+        return;
+      }
+      const requestWakeLock = async () => {
+        try {
+          _wakeLock = await navigator.wakeLock.request('screen');
+          console.log('got wake lock!');
+          _wakeLock.addEventListener('release', () => {
+            _wakeLock = undefined;
+          });
+        } catch (err) { }
+      };
+      requestWakeLock();
+    },
+
+    encode_bytes: function (wasmData) {
+      var res = Module._cimbare_encode(wasmData.byteOffset, wasmData.length);
+      console.log("encode returned " + res);
+
+      if (res == 0) {
+        Main.setActive();
+      }
     },
 
     dragDrop: function (event) {
@@ -186,8 +234,9 @@ var Main = function () {
     fileInput: function (ev) {
       console.log("file input: " + ev);
       var file = document.getElementById('file_input').files[0];
-      if (file)
+      if (file) {
         importFile(file);
+      }
       Main.blurNav(false);
     },
 
@@ -199,7 +248,7 @@ var Main = function () {
       var start = performance.now();
       if (!Main.isPaused()) {
         Module._cimbare_render();
-        var frameCount = Module._cimbare_next_frame();
+        var frameCount = Module._cimbare_next_frame(_colorBalance);
       }
 
       var elapsed = performance.now() - start;
@@ -210,9 +259,9 @@ var Main = function () {
         _renderTime += elapsed;
         Main.setHTML("status", elapsed + " : " + frameCount + " : " + Math.ceil(_renderTime / frameCount));
       }
-      if (!(_counter & 15)) {
-        Main.resize();
-        Main.checkNavButtonOverlap();
+
+      if (!Main.isPaused() && _counter % 16 == 0) {
+        setTimeout(Main.prevent_sleep, 0);
       }
     },
 
@@ -224,21 +273,56 @@ var Main = function () {
     },
 
     setMode: function (mode_str) {
-      var is_4c = (mode_str == "4C");
-      Module._cimbare_configure(2, 255, 255, is_4c);
+      let modeVal = 68;
+      if (mode_str == "4C") {
+        modeVal = 4;
+      }
+      else if (mode_str == "Bu") {
+        modeVal = 66;
+      }
+      else if (mode_str == "Bm") {
+        modeVal = 67;
+      }
+      Module._cimbare_configure(modeVal, -1);
       _idealRatio = Module._cimbare_get_aspect_ratio();
+      Main.resize();
 
       var nav = document.getElementById("nav-container");
-      if (is_4c) {
+      if (modeVal == 4) {
         nav.classList.remove("mode-b");
         nav.classList.add("mode-4c");
-      } else if (mode_str == "B") {
+        nav.classList.remove("mode-b");
+        nav.classList.remove("mode-bm");
+        nav.classList.remove("mode-bu");
+      } else if (modeVal == 66) {
+        nav.classList.add("mode-bu");
+        nav.classList.remove("mode-b");
+        nav.classList.remove("mode-bm");
+        nav.classList.remove("mode-4c");
+      } else if (modeVal == 67) {
+        nav.classList.add("mode-bm");
+        nav.classList.remove("mode-b");
+        nav.classList.remove("mode-bu");
+        nav.classList.remove("mode-4c");
+      } else if (modeVal == 68) {
         nav.classList.add("mode-b");
+        nav.classList.remove("mode-bm");
+        nav.classList.remove("mode-bu");
         nav.classList.remove("mode-4c");
       } else {
         nav.classList.remove("mode-b");
+        nav.classList.remove("mode-bm");
+        nav.classList.remove("mode-bu");
         nav.classList.remove("mode-4c");
       }
+    },
+
+    setFPS: function (val) {
+      if (!val) {
+        return;
+      }
+      _interval = Math.floor(1000 / val);
+      console.log("new frame delay interval is " + _interval);
     },
 
     setHTML: function (id, msg) {
@@ -365,3 +449,7 @@ window.addEventListener("drop", function (e) {
   Main.dragDrop(e);
   document.body.style["opacity"] = 1.0;
 }, false);
+
+window.addEventListener('resize', () => {
+  Main.resize();
+});
